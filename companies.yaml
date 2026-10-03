@@ -23,16 +23,18 @@
 # noise and makes the prefilter counts impossible to reason about.
 
 companies:
-  - {ats: greenhouse, slug: stripe,      name: Stripe}
-  - {ats: greenhouse, slug: databricks,  name: Databricks}
-  - {ats: greenhouse, slug: cloudflare,  name: Cloudflare}
-  - {ats: greenhouse, slug: figma,       name: Figma}
-  - {ats: greenhouse, slug: dropbox,     name: Dropbox}
-  - {ats: greenhouse, slug: coinbase,    name: Coinbase}
-  - {ats: greenhouse, slug: reddit,      name: Reddit}
-  - {ats: lever,      slug: voleon,      name: Voleon}
-
-  - {ats: ashby,      slug: openai,      name: OpenAI}
-  - {ats: ashby,      slug: ramp,        name: Ramp}
-  - {ats: ashby,      slug: linear,      name: Linear}
-  - {ats: ashby,      slug: vanta,       name: Vanta}
+- {ats: ashby, slug: sarvam, name: Sarvam}
+- {ats: ashby, slug: emergence, name: Emergence}
+- {ats: ashby, slug: aiprise, name: AiPrise}
+- {ats: lever, slug: drivetrain, name: Drivetrain}
+- {ats: lever, slug: trackmind, name: Trackmind}
+- {ats: lever, slug: tsmg, name: TSMG}
+- {ats: lever, slug: brevo, name: Brevo}
+- {ats: ashby, slug: litmus, name: Litmus}
+- {ats: lever, slug: paytm, name: Paytm}
+- {ats: lever, slug: portcast, name: Portcast}
+- {ats: lever, slug: merklescience, name: Merkle Science}
+- {ats: lever, slug: thinkahead, name: AHEAD}
+- {ats: lever, slug: gohighlevel, name: HighLevel}
+- {ats: ashby, slug: tekion, name: Tekion}
+- {ats: ashby, slug: interview-kickstart, name: Interview Kickstart}
