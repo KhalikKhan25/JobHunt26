@@ -9,6 +9,8 @@ from typing import Any, Iterable
 
 import requests
 
+from .retries import MAX_ATTEMPTS, RETRYABLE_STATUSES, request_with_retries
+
 UA = {"User-Agent": "jobhunt/1.0 (personal job search agent)"}
 TIMEOUT = 20
 
@@ -44,6 +46,7 @@ class Job:
     score: float | None = None
     reason: str | None = None
     draft: dict[str, Any] = field(default_factory=dict)
+    draft_error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -138,9 +141,14 @@ def fetch_board(ats: str, slug: str, company: str | None = None,
     url_tpl, parser = ENDPOINTS[ats]
     sess = session or requests
     try:
-        r = sess.get(url_tpl.format(slug=slug), headers=UA, timeout=TIMEOUT)
+        r = request_with_retries(
+            sess.get, url_tpl.format(slug=slug), headers=UA, timeout=TIMEOUT)
         if r.status_code != 200:
-            print(f"  ! {ats}/{slug} -> HTTP {r.status_code}")
+            if r.status_code in RETRYABLE_STATUSES:
+                print(f"  ! {ats}/{slug} -> temporary HTTP {r.status_code} after "
+                      f"{MAX_ATTEMPTS} attempts; will retry next run")
+            else:
+                print(f"  ! {ats}/{slug} -> HTTP {r.status_code}")
             return []
         return parser(slug, company or slug, r.json())
     except Exception as e:  # dead slug, rate limit, network blip

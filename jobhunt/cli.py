@@ -18,7 +18,7 @@ from . import llm, mailer
 from .fetch import fetch_all
 from .mock import fetch_all_mock
 from .prefilter import prefilter
-from .providers import LLMError, resolve
+from .providers import LLMError, resolve, safe_error_message
 from .store import Store
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -75,7 +75,7 @@ def cmd_profile(args) -> int:
             is_pdf=is_pdf, provider=provider, model=model,
         )
     except (LLMError, ValueError) as e:
-        print(f"profile extraction failed: {e}")
+        print(f"profile extraction failed: {safe_error_message(e)}")
         return 1
 
     Path(args.out).write_text(json.dumps(profile, indent=2, ensure_ascii=False),
@@ -113,12 +113,16 @@ def cmd_run(args) -> int:
     print("\n[2/5] filtering")
     jobs = prefilter(jobs, filters)
     passed_filters = len(jobs)
-    jobs = store.unseen(jobs)
-    print(f"  new since last run: {len(jobs)}")
-    candidates = len(jobs)
+    new_jobs = store.unseen(jobs)
+    retry_jobs = store.pending_drafts(jobs)
+    print(f"  new since last run: {len(new_jobs)}")
+    if retry_jobs:
+        print(f"  draft retries pending: {len(retry_jobs)}")
+    candidates = len(new_jobs)
     if args.limit:
-        jobs = jobs[:args.limit]
+        new_jobs = new_jobs[:args.limit]
         print(f"  --limit {args.limit} applied")
+    jobs = new_jobs + retry_jobs
 
     if not jobs:
         subject, doc = digest_mod.build([], scanned, 0, store.stats())
@@ -129,23 +133,26 @@ def cmd_run(args) -> int:
     # ---- 3. screen
     scorer = "keyword" if args.scorer == "keyword" else "llm"
     if scorer == "keyword":
-        print(f"\n[3/5] screening {len(jobs)} jobs (keyword stub — DEV ONLY)")
-        llm.keyword_screen(jobs, profile)
-    else:
+        print(f"\n[3/5] screening {len(new_jobs)} jobs (keyword stub — DEV ONLY)")
+        llm.keyword_screen(new_jobs, profile)
+    elif new_jobs:
         try:
             provider, model = resolve("screen")
         except LLMError as e:
-            print(f"\n{e}\nNo key? Run with --scorer keyword for an offline dry run.")
+            detail = safe_error_message(e)
+            print(f"\n{detail}\nNo key? Run with --scorer keyword for an offline dry run.")
             return 1
-        print(f"\n[3/5] screening {len(jobs)} jobs via {provider.name}/{model}")
-        llm.screen(jobs, profile,
+        print(f"\n[3/5] screening {len(new_jobs)} jobs via {provider.name}/{model}")
+        llm.screen(new_jobs, profile,
                    batch_size=int(cfg.get("screen_batch_size", 8)),
                    jd_chars=int(cfg.get("screen_jd_chars", 1400)),
                    provider=provider, model=model)
+    else:
+        print("\n[3/5] no new jobs to screen; retrying saved draft failures")
 
     # If every batch failed, the digest would be empty and — worse — we would
     # record these jobs as seen and never show them again. Bail instead.
-    if scorer == "llm" and not any(j.score is not None for j in jobs):
+    if scorer == "llm" and new_jobs and not any(j.score is not None for j in new_jobs):
         print("\n! screening scored nothing: every batch failed.\n"
               "  Not recording these jobs, so the next run retries them.\n"
               "  Check the warnings above (bad key, rate limit, wrong model id).")
@@ -153,9 +160,21 @@ def cmd_run(args) -> int:
 
     threshold = float(cfg.get("score_threshold", 7.0))
     top_n = int(cfg.get("max_per_digest", 5))
-    shortlist = sorted([j for j in jobs if (j.score or 0) >= threshold],
+    shortlist = sorted([j for j in jobs if j.score is not None and j.score >= threshold],
                        key=lambda j: j.score or 0, reverse=True)[:top_n]
     print(f"  {len(shortlist)} scored >= {threshold}")
+    selected_ids = {j.job_id for j in shortlist}
+    for job in jobs:
+        if job.score is None:
+            detail = "no screening score returned"
+        elif job.score < threshold:
+            detail = f"score below threshold {threshold}"
+        elif job.job_id not in selected_ids:
+            detail = f"score cleared threshold but fell outside top {top_n}"
+        else:
+            detail = ("selected; match reason: "
+                      f"{safe_error_message(job.reason or 'not provided')}")
+        print(f"  screening {job.job_id}: score={job.score!r}; {detail}")
 
     # ---- 4. draft
     print(f"\n[4/5] drafting kits for {len(shortlist)}")
@@ -171,29 +190,42 @@ def cmd_run(args) -> int:
                       jd_chars=int(cfg.get("draft_jd_chars", 6000)),
                       provider=provider, model=model)
         except LLMError as e:
-            print(f"  ! drafting unavailable: {e}")
+            detail = safe_error_message(e)
+            print(f"  ! drafting unavailable: {detail}")
+            for job in shortlist:
+                job.draft_error = detail
 
     # ---- 5. digest
     print("\n[5/5] digest")
-    subject, doc = digest_mod.build(shortlist, scanned, candidates, store.stats())
+    digest_jobs = [j for j in shortlist if j.draft_error is None]
+    subject, doc = digest_mod.build(digest_jobs, scanned, candidates, store.stats())
     path = digest_mod.write(doc, cfg.get("digest_file", "out/digest.html"))
     print(f"  wrote {path}")
 
-    sent = False
+    emailed_ids: set[str] = set()
     if args.send:
-        try:
-            mailer.send(subject, doc)
-            sent = True
-        except Exception as e:  # bad app password, blocked port, offline
-            print(f"  ! email failed ({type(e).__name__}: {e}) — digest still on disk")
+        email_jobs = [j for j in digest_jobs if not store.was_emailed(j.job_id)]
+        if email_jobs or not shortlist:
+            email_subject, email_doc = digest_mod.build(
+                email_jobs, scanned, candidates, store.stats())
+            try:
+                mailer.send(email_subject, email_doc)
+                emailed_ids = {j.job_id for j in email_jobs}
+            except Exception as e:  # bad app password, blocked port, offline
+                detail = safe_error_message(e)
+                print(f"  ! email failed ({type(e).__name__}: {detail}) — digest still on disk")
+        elif shortlist and not digest_jobs:
+            print("  ! email skipped: all draft generations failed")
+        else:
+            print("  no unemailed jobs; email skipped")
     else:
         print("  --send not passed, email skipped")
 
-    store.record(jobs, emailed=sent)
+    store.record(jobs, emailed=emailed_ids)
     csv_path = store.export_csv(cfg.get("tracker_csv", "out/tracker.csv"))
 
     print(f"\nfunnel: {scanned} scanned -> {passed_filters} passed filters "
-          f"-> {candidates} new -> {len(shortlist)} in digest")
+          f"-> {candidates} new -> {len(digest_jobs)} in digest")
     print(f"subject: {subject}")
     print(f"tracker: {store.stats()}  ({csv_path})")
     return 0

@@ -71,6 +71,10 @@ The shipped list is **examples** — verify each before trusting the output.
 Companies migrate between ATS vendors and slugs go dead. A dead slug prints an
 HTTP status and returns nothing; it never kills the run. Watch the per-board
 counts on stdout: a board reporting 0 every day is a slug that needs fixing.
+HTTP 429, 500, 502, 503, and 504 responses are retried up to three times with
+exponential backoff, honoring `Retry-After` when provided. An exhausted
+temporary failure is logged for the next run and does not stop other boards
+from being fetched.
 
 Start with 10–15 companies. A list of 200 is mostly noise.
 
@@ -165,6 +169,11 @@ python -m jobhunt stats                                 # + CSV export
 ```
 
 `out/tracker.csv` opens in any spreadsheet.
+
+Temporary draft-generation failures and their errors are saved in `seen.json`
+and retried on a later run. A failed draft is omitted from the email until it
+generates successfully. `emailed` counts only jobs included in a successfully
+sent digest; `applied` changes only through the explicit `applied` command.
 
 ---
 

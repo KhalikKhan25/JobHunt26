@@ -18,11 +18,25 @@ from typing import Any
 
 import requests
 
+from .retries import MAX_ATTEMPTS, RETRYABLE_STATUSES, request_with_retries
+
 TIMEOUT = 120
 
 
 class LLMError(RuntimeError):
     """Anything that came back wrong from a provider."""
+
+
+def safe_error_message(error: Exception | str) -> str:
+    """Keep configured credentials out of messages persisted or printed."""
+    message = str(error)
+    for name, value in os.environ.items():
+        upper_name = name.upper()
+        if value and (upper_name == "SMTP_USER" or any(
+                secret in upper_name for secret in (
+                    "KEY", "TOKEN", "SECRET", "PASSWORD", "_PASS"))):
+            message = message.replace(value, "[REDACTED]")
+    return message
 
 
 class UnsupportedDocument(LLMError):
@@ -125,18 +139,31 @@ class GeminiProvider(Provider):
     BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
     def _post(self, model: str, body: dict) -> str:
-        r = requests.post(
-            f"{self.BASE}/{model}:generateContent",
-            params={"key": self._env("GEMINI_API_KEY")},
-            json=body,
-            timeout=TIMEOUT,
-        )
+        try:
+            r = request_with_retries(
+                requests.post,
+                f"{self.BASE}/{model}:generateContent",
+                params={"key": self._env("GEMINI_API_KEY")},
+                json=body,
+                timeout=TIMEOUT,
+            )
+        except (requests.ConnectionError, requests.Timeout) as e:
+            raise LLMError(
+                f"gemini request failed after {MAX_ATTEMPTS} attempts "
+                f"({type(e).__name__})"
+            ) from None
+        except requests.RequestException as e:
+            raise LLMError(
+                f"gemini request failed ({type(e).__name__})"
+            ) from None
         if r.status_code != 200:
-            raise LLMError(f"gemini HTTP {r.status_code}: {r.text[:300]}")
+            retry_note = (f" after {MAX_ATTEMPTS} attempts"
+                          if r.status_code in RETRYABLE_STATUSES else "")
+            raise LLMError(f"gemini HTTP {r.status_code}{retry_note}")
         try:
             candidate = r.json()["candidates"][0]
         except (KeyError, IndexError, ValueError) as e:
-            raise LLMError(f"gemini returned no candidates: {r.text[:300]}") from e
+            raise LLMError("gemini returned no candidates") from e
 
         # Gemini 2.5+ spends output tokens on internal thinking, so a tight
         # maxOutputTokens gets consumed before the answer starts. That arrives
@@ -151,7 +178,7 @@ class GeminiProvider(Provider):
                 f"{len(text)} chars of output — raise max_tokens for this stage"
             )
         if not text:
-            raise LLMError(f"gemini returned no text: {r.text[:300]}")
+            raise LLMError("gemini returned no text")
         return text
 
     def complete(self, model: str, system: str, user: str, max_tokens: int,

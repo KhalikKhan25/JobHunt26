@@ -17,9 +17,11 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from jobhunt import mock
+from jobhunt import fetch as fetch_mod
 from jobhunt.fetch import parse_ashby, parse_greenhouse, parse_lever, strip_html
 from jobhunt.mock import fetch_all_mock
 from jobhunt.prefilter import prefilter
+from jobhunt.retries import MAX_ATTEMPTS
 
 CONFIG = yaml.safe_load((Path(__file__).resolve().parent.parent / "config.yaml")
                         .read_text(encoding="utf-8"))
@@ -107,6 +109,112 @@ def test_parsers_take_decoded_json_not_a_response():
     assert parse_ashby("x", "X", {}) == []
 
 
+# -------------------------------------------------------------- HTTP retry ---
+
+class HttpResponse:
+    def __init__(self, status_code, body=None, headers=None):
+        self.status_code = status_code
+        self._body = body
+        self.headers = headers or {}
+
+    def json(self):
+        return self._body
+
+
+def test_fetch_board_retries_transient_http_then_succeeds(monkeypatch):
+    class Session:
+        def __init__(self):
+            self.responses = [
+                HttpResponse(502),
+                HttpResponse(200, {"jobs": [{"id": 1, "title": "Engineer"}]}),
+            ]
+            self.calls = 0
+
+        def get(self, *args, **kwargs):
+            self.calls += 1
+            return self.responses.pop(0)
+
+    session = Session()
+    monkeypatch.setattr("jobhunt.retries.time.sleep", lambda _: None)
+
+    jobs = fetch_mod.fetch_board("greenhouse", "acme", session=session)
+
+    assert len(jobs) == 1
+    assert session.calls == 2
+
+
+def test_fetch_all_continues_after_exhausted_transient_board(monkeypatch, capsys):
+    class Session:
+        def __init__(self):
+            self.calls = {}
+
+        def get(self, url, **kwargs):
+            self.calls[url] = self.calls.get(url, 0) + 1
+            if "portcast" in url:
+                return HttpResponse(503)
+            return HttpResponse(200, {
+                "jobs": [{"id": 2, "title": "Engineer"}],
+            })
+
+    session = Session()
+    monkeypatch.setattr(fetch_mod.requests, "Session", lambda: session)
+    monkeypatch.setattr("jobhunt.retries.time.sleep", lambda _: None)
+    monkeypatch.setattr(fetch_mod.time, "sleep", lambda _: None)
+
+    jobs = fetch_mod.fetch_all([
+        {"ats": "greenhouse", "slug": "portcast"},
+        {"ats": "greenhouse", "slug": "acme"},
+    ], sleep=0)
+
+    assert len(jobs) == 1
+    assert session.calls[next(url for url in session.calls if "portcast" in url)] == MAX_ATTEMPTS
+    output = capsys.readouterr().out
+    assert "temporary HTTP 503" in output
+    assert "will retry next run" in output
+    assert "1 jobs" in output
+
+
+def test_fetch_board_respects_retry_after(monkeypatch):
+    delays = []
+
+    class Session:
+        def __init__(self):
+            self.responses = [
+                HttpResponse(429, headers={"Retry-After": "3"}),
+                HttpResponse(200, {"jobs": []}),
+            ]
+
+        def get(self, *args, **kwargs):
+            return self.responses.pop(0)
+
+    monkeypatch.setattr("jobhunt.retries.time.sleep", delays.append)
+
+    fetch_mod.fetch_board("greenhouse", "acme", session=Session())
+
+    assert delays == [3.0]
+
+
+def test_retry_uses_exponential_backoff(monkeypatch):
+    delays = []
+
+    class Session:
+        def __init__(self):
+            self.responses = [
+                HttpResponse(503),
+                HttpResponse(502),
+                HttpResponse(200, {"jobs": []}),
+            ]
+
+        def get(self, *args, **kwargs):
+            return self.responses.pop(0)
+
+    monkeypatch.setattr("jobhunt.retries.time.sleep", delays.append)
+
+    fetch_mod.fetch_board("greenhouse", "acme", session=Session())
+
+    assert delays == [1.0, 2.0]
+
+
 # -------------------------------------------------------------- prefilter ---
 
 @pytest.mark.parametrize("title", [
@@ -186,3 +294,45 @@ def test_allow_remote_is_what_lets_an_out_of_region_remote_role_through():
 def test_empty_filters_keep_everything():
     jobs = fetch_all_mock()
     assert len(prefilter(jobs, {})) == len(jobs)
+
+
+def test_prefilter_logs_specific_rejection_reasons(capsys):
+    from jobhunt.fetch import Job
+
+    jobs = [
+        Job("lever:x:1", "lever", "X", "Senior Backend Engineer", "India",
+            "https://example.com/1", "Go"),
+        Job("lever:x:2", "lever", "X", "Backend Engineer", "San Francisco",
+            "https://example.com/2", "Go"),
+        Job("lever:x:3", "lever", "X", "Backend Engineer", "India",
+            "https://example.com/3", "Go", posted_at="2000-01-01"),
+    ]
+
+    kept = prefilter(jobs, {
+        "include_titles": ["backend"],
+        "exclude_titles": ["senior"],
+        "locations": ["india"],
+        "max_age_days": 30,
+    })
+
+    assert kept == []
+    output = capsys.readouterr().out
+    assert "lever:x:1" in output and "excluded by title pattern" in output
+    assert "lever:x:2" in output and "did not match configured locations" in output
+    assert "lever:x:3" in output and "older than 30 days" in output
+
+
+def test_prefilter_limits_examples_per_category(capsys):
+    from jobhunt.fetch import Job
+
+    jobs = [
+        Job(f"lever:x:{i}", "lever", "X", "Account Executive", "India",
+            "https://example.com", "Sales")
+        for i in range(10)
+    ]
+
+    assert prefilter(jobs, {"include_titles": ["backend"]}) == []
+
+    output = capsys.readouterr().out
+    assert "prefilter title: 10" in output
+    assert output.count("e.g. lever:x:") == 3

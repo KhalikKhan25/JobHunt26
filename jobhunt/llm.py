@@ -15,7 +15,7 @@ import re
 from typing import Any
 
 from .fetch import Job
-from .providers import LLMError, Provider, resolve
+from .providers import LLMError, Provider, resolve, safe_error_message
 
 _FENCE_OPEN = re.compile(r"^\s*```(?:json|JSON)?\s*", re.M)
 _FENCE_CLOSE = re.compile(r"\s*```\s*$", re.M)
@@ -179,7 +179,8 @@ def screen(jobs: list[Job], profile: dict, batch_size: int = 8, jd_chars: int = 
                 if jid:
                     results[str(jid)] = r
         except (LLMError, ValueError, KeyError, TypeError) as e:
-            print(f"  ! screen batch {n} failed ({type(e).__name__}: {e}) — skipping")
+            detail = safe_error_message(e)
+            print(f"  ! screen batch {n} failed ({type(e).__name__}: {detail}) — skipping")
             continue
 
         for j in batch:
@@ -247,9 +248,12 @@ def draft(jobs: list[Job], profile: dict, jd_chars: int = 6000,
                 "cover_note": str(kit.get("cover_note") or ""),
                 "questions_to_ask": [str(q) for q in (kit.get("questions_to_ask") or [])],
             }
+            j.draft_error = None
             print(f"  drafted {j.title} @ {j.company}")
         except (LLMError, ValueError, KeyError, TypeError) as e:
-            print(f"  ! draft failed for {j.job_id} ({type(e).__name__}: {e})")
+            j.draft_error = safe_error_message(e)
+            print(f"  ! draft failed for {j.job_id} "
+                  f"({type(e).__name__}: {j.draft_error})")
             j.draft = {k: ("" if k in ("fit_summary", "cover_note") else []) for k in DRAFT_KEYS}
 
     return jobs

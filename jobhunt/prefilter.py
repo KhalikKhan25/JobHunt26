@@ -11,10 +11,7 @@ from datetime import datetime, timedelta, timezone
 from .fetch import Job
 
 REMOTE_HINTS = ("remote", "anywhere", "work from home", "wfh", "distributed")
-
-
-def _any_match(patterns: list[str], text: str) -> bool:
-    return any(re.search(p, text, re.I) for p in patterns)
+DIAGNOSTIC_SAMPLES = 3
 
 
 def _parse_date(value: str | None) -> datetime | None:
@@ -39,26 +36,68 @@ def prefilter(jobs: list[Job], cfg: dict) -> list[Job]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=max_age) if max_age else None
 
     kept, stats = [], {"title": 0, "location": 0, "age": 0}
+    examples: dict[str, list[str]] = {
+        "title": [], "location": [], "age": [], "matched": [],
+    }
+
+    def add_example(category: str, message: str) -> None:
+        if len(examples[category]) < DIAGNOSTIC_SAMPLES:
+            examples[category].append(message)
+
     for j in jobs:
-        if not _any_match(inc, j.title) or (exc and _any_match(exc, j.title)):
+        include_pattern = next((p for p in inc if re.search(p, j.title, re.I)), None)
+        include_match = include_pattern is not None
+        excluded_by = (next((p for p in exc if re.search(p, j.title, re.I)), None)
+                       if include_match else None)
+        if not include_match or excluded_by is not None:
             stats["title"] += 1
+            reason = (f"excluded by title pattern {excluded_by!r}" if excluded_by
+                      else "no include-title pattern matched")
+            add_example("title", f"{j.job_id} ({j.title!r}): {reason}")
             continue
 
+        is_remote = False
+        location_match = None
         if locs:
             hay = f"{j.location} {j.title}".lower()
             is_remote = allow_remote and any(h in hay for h in REMOTE_HINTS)
-            if not is_remote and not any(l in hay for l in locs):
+            location_match = next((loc for loc in locs if loc in hay), None)
+            location_matches = any(loc in hay for loc in locs)
+            if not is_remote and not location_matches:
                 stats["location"] += 1
+                add_example("location", f"{j.job_id} ({j.title!r}): "
+                            f"location {j.location!r} did not match configured locations")
                 continue
 
+        posted = _parse_date(j.posted_at) if cutoff else None
         if cutoff:
-            posted = _parse_date(j.posted_at)
             if posted and posted < cutoff:
                 stats["age"] += 1
+                add_example("age", f"{j.job_id} ({j.title!r}): "
+                            f"posted {j.posted_at} is older than {max_age} days")
                 continue
 
+        location_reason = ("remote posting allowed" if is_remote else
+                           f"location matched {location_match!r}" if locs else
+                           "location filter disabled")
+        freshness_reason = (f"posted {j.posted_at} within {max_age} days"
+                            if cutoff and posted else
+                            "no parseable posted date; freshness not checked"
+                            if cutoff else "freshness filter disabled")
+        add_example("matched", f"{j.job_id} ({j.title!r}): "
+                    f"title pattern {include_pattern!r}; {location_reason}; "
+                    f"{freshness_reason}")
         kept.append(j)
 
     print(f"  prefilter: {len(jobs)} -> {len(kept)} "
           f"(dropped title={stats['title']} location={stats['location']} stale={stats['age']})")
+    for category, count in (
+            ("title", stats["title"]), ("location", stats["location"]),
+            ("age", stats["age"]), ("matched", len(kept))):
+        if not count:
+            continue
+        label = "stale" if category == "age" else category
+        print(f"  prefilter {label}: {count}")
+        for example in examples[category]:
+            print(f"    e.g. {example}")
     return kept

@@ -242,6 +242,7 @@ def test_failed_draft_leaves_a_renderable_empty_kit(capsys):
     stub = StubProvider(["not json"])
     llm.draft(jobs, PROFILE, provider=stub, model="m")
     assert set(jobs[0].draft) == set(llm.DRAFT_KEYS)
+    assert jobs[0].draft_error == "could not parse JSON from model reply: 'not json'"
     assert "draft failed" in capsys.readouterr().out
 
 
@@ -250,6 +251,18 @@ def test_draft_makes_one_call_per_job():
     stub = StubProvider(['{"fit_summary":"a"}'] * 3)
     llm.draft(jobs, PROFILE, provider=stub, model="m")
     assert len(stub.calls) == 3
+
+
+def test_draft_continues_after_one_job_fails():
+    jobs = make_jobs(2)
+    kit = json.dumps({"fit_summary": "fit"})
+    stub = StubProvider([LLMError("temporary error"), kit])
+
+    llm.draft(jobs, PROFILE, provider=stub, model="m")
+
+    assert len(stub.calls) == 2
+    assert jobs[0].draft_error == "temporary error"
+    assert jobs[1].draft["fit_summary"] == "fit"
 
 
 # ------------------------------------------------- keyword stub (no API) ---
@@ -352,3 +365,86 @@ def test_both_stages_ask_for_json_mode_and_leave_room_for_thinking():
 def test_providers_without_document_support_say_so():
     with pytest.raises(providers.UnsupportedDocument):
         providers.GroqProvider().complete_document("m", "prompt", b"%PDF", 100)
+
+
+class GeminiResponse:
+    def __init__(self, status_code, body=None, headers=None, text=""):
+        self.status_code = status_code
+        self._body = body or {}
+        self.headers = headers or {}
+        self.text = text
+
+    def json(self):
+        return self._body
+
+
+def test_gemini_503_retries_then_generates_the_draft(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setattr("jobhunt.retries.time.sleep", lambda _: None)
+    kit = {"fit_summary": "Good fit", "tailored_bullets": [],
+           "gaps": [], "cover_note": "", "questions_to_ask": []}
+    responses = [
+        GeminiResponse(503, headers={"Retry-After": "0"}),
+        GeminiResponse(200, {"candidates": [{
+            "finishReason": "STOP",
+            "content": {"parts": [{"text": json.dumps(kit)}]},
+        }]}),
+    ]
+    calls = []
+
+    def post(*args, **kwargs):
+        calls.append((args, kwargs))
+        return responses.pop(0)
+
+    monkeypatch.setattr(providers.requests, "post", post)
+    jobs = make_jobs(1)
+
+    llm.draft(jobs, PROFILE, provider=providers.GeminiProvider(), model="m")
+
+    assert len(calls) == 2
+    assert jobs[0].draft["fit_summary"] == "Good fit"
+    assert jobs[0].draft_error is None
+
+
+def test_exhausted_gemini_retries_record_safe_error_and_remain_retryable(
+        monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-secret")
+    monkeypatch.setattr("jobhunt.retries.time.sleep", lambda _: None)
+    calls = []
+
+    def post(*args, **kwargs):
+        calls.append((args, kwargs))
+        return GeminiResponse(503, text="temporary service issue")
+
+    monkeypatch.setattr(providers.requests, "post", post)
+    jobs = make_jobs(1)
+    jobs[0].score = 8.0
+    jobs[0].reason = "strong match"
+
+    llm.draft(jobs, PROFILE, provider=providers.GeminiProvider(), model="m")
+
+    from jobhunt.store import Store
+    store = Store(tmp_path / "seen.json")
+    store.record(jobs, emailed=set())
+
+    assert len(calls) == 3
+    assert jobs[0].draft_error == "gemini HTTP 503 after 3 attempts"
+    assert "test-gemini-secret" not in capsys.readouterr().out
+    assert "test-gemini-secret" not in store.data[jobs[0].job_id]["draft_error"]
+    retry = make_jobs(1)
+    assert store.pending_drafts(retry) == retry
+    assert retry[0].score == 8.0
+    assert retry[0].reason == "strong match"
+
+
+def test_safe_error_message_redacts_api_and_smtp_credentials(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "api-secret")
+    monkeypatch.setenv("SMTP_USER", "sender@example.com")
+    monkeypatch.setenv("SMTP_PASS", "smtp-secret")
+
+    safe = providers.safe_error_message(
+        "api-secret sender@example.com smtp-secret")
+
+    assert "api-secret" not in safe
+    assert "sender@example.com" not in safe
+    assert "smtp-secret" not in safe

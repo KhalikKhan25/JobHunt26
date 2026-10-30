@@ -22,10 +22,26 @@ class Store:
     def unseen(self, jobs: list[Job]) -> list[Job]:
         return [j for j in jobs if j.job_id not in self.data]
 
-    def record(self, jobs: list[Job], emailed: bool) -> None:
+    def pending_drafts(self, jobs: list[Job]) -> list[Job]:
+        pending = []
+        for job in jobs:
+            record = self.data.get(job.job_id, {})
+            if record.get("draft_status") != "failed":
+                continue
+            job.score = record.get("score")
+            job.reason = record.get("reason")
+            pending.append(job)
+        return pending
+
+    def was_emailed(self, job_id: str) -> bool:
+        return bool(self.data.get(job_id, {}).get("emailed"))
+
+    def record(self, jobs: list[Job], emailed: bool | set[str]) -> None:
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        emailed_ids = ({j.job_id for j in jobs} if emailed is True
+                       else emailed if isinstance(emailed, set) else set())
         for j in jobs:
-            self.data.setdefault(j.job_id, {
+            record = self.data.setdefault(j.job_id, {
                 "first_seen": now,
                 "company": j.company,
                 "title": j.title,
@@ -33,10 +49,23 @@ class Store:
                 "url": j.url,
                 "score": j.score,
                 "reason": j.reason,
-                "emailed": emailed,
+                "emailed": False,
                 "applied": False,
                 "applied_on": None,
+                "draft_status": "not_generated",
+                "draft_error": None,
             })
+            if j.score is not None:
+                record["score"] = j.score
+                record["reason"] = j.reason
+            if j.job_id in emailed_ids:
+                record["emailed"] = True
+            if j.draft_error is not None:
+                record["draft_status"] = "failed"
+                record["draft_error"] = j.draft_error
+            elif j.draft:
+                record["draft_status"] = "generated"
+                record["draft_error"] = None
         self.save()
 
     def mark_applied(self, job_id: str) -> bool:
